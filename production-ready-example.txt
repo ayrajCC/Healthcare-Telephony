@@ -1,0 +1,424 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <fstream>
+#include <atomic>
+#include <memory>
+#include <cstdint>
+
+#include "cxone_api.h" // NICE CXone API wrapper
+#include "audio_processor.h" // Audio processing utilities
+#include "sentiment_analyzer.h" // Sentiment analysis engine
+#include "call_transcriber.h" // Real-time transcription
+#include "healthcare_compliance.h" // Healthcare compliance rules
+
+/**
+ * @brief Real-time call analysis system for healthcare applications
+ * 
+ * This system processes incoming call audio streams in real-time to:
+ * - Transcribe conversations
+ * - Analyze sentiment
+ * - Detect compliance issues
+ * - Flag potential escalation scenarios
+ * - Provide real-time guidance to agents
+ */
+class HealthcareCallAnalyzer {
+public:
+    /**
+     * @brief Configuration for the call analyzer
+     */
+    struct Config {
+        std::string apiKey;
+        std::string apiEndpoint;
+        uint32_t bufferSizeMs;
+        uint32_t samplingRate;
+        uint32_t channels;
+        std::string complianceRulesPath;
+        bool enableTranscription;
+        bool enableSentimentAnalysis;
+        bool enableComplianceChecking;
+        
+        Config() :
+            bufferSizeMs(100),
+            samplingRate(8000),
+            channels(1),
+            enableTranscription(true),
+            enableSentimentAnalysis(true),
+            enableComplianceChecking(true) {}
+    };
+    
+    /**
+     * @brief Call analysis result
+     */
+    struct AnalysisResult {
+        std::string callId;
+        std::string transcriptSegment;
+        float customerSentiment; // -1.0 (negative) to 1.0 (positive)
+        float agentSentiment;
+        std::vector<std::string> complianceAlerts;
+        std::vector<std::string> suggestedResponses;
+        std::chrono::system_clock::time_point timestamp;
+        
+        AnalysisResult() : customerSentiment(0.0f), agentSentiment(0.0f) {
+            timestamp = std::chrono::system_clock::now();
+        }
+    };
+    
+    /**
+     * @brief Constructor
+     * @param config Configuration parameters
+     */
+    HealthcareCallAnalyzer(const Config& config) : 
+        m_config(config),
+        m_isRunning(false),
+        m_processingThread(nullptr)
+    {
+        // Initialize CXone API
+        m_cxoneApi = std::make_unique<CXoneAPI>(config.apiKey, config.apiEndpoint);
+        
+        // Initialize audio processor
+        AudioProcessor::Config audioConfig;
+        audioConfig.samplingRate = config.samplingRate;
+        audioConfig.channels = config.channels;
+        audioConfig.bufferSizeMs = config.bufferSizeMs;
+        m_audioProcessor = std::make_unique<AudioProcessor>(audioConfig);
+        
+        // Initialize transcriber if enabled
+        if (config.enableTranscription) {
+            m_transcriber = std::make_unique<CallTranscriber>();
+        }
+        
+        // Initialize sentiment analyzer if enabled
+        if (config.enableSentimentAnalysis) {
+            m_sentimentAnalyzer = std::make_unique<SentimentAnalyzer>();
+        }
+        
+        // Initialize compliance checker if enabled
+        if (config.enableComplianceChecking) {
+            m_complianceChecker = std::make_unique<HealthcareCompliance>(config.complianceRulesPath);
+        }
+        
+        // Load healthcare-specific response templates
+        loadResponseTemplates();
+    }
+    
+    /**
+     * @brief Destructor
+     */
+    ~HealthcareCallAnalyzer() {
+        stop();
+    }
+    
+    /**
+     * @brief Start analyzing a call
+     * @param callId Unique identifier for the call
+     * @return True if successfully started
+     */
+    bool startCall(const std::string& callId) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        if (m_activeCalls.find(callId) != m_activeCalls.end()) {
+            std::cerr << "Call ID already active: " << callId << std::endl;
+            return false;
+        }
+        
+        m_activeCalls[callId] = {};
+        
+        // Start processing thread if not already running
+        if (!m_isRunning) {
+            m_isRunning = true;
+            m_processingThread = std::make_unique<std::thread>(&HealthcareCallAnalyzer::processingLoop, this);
+        }
+        
+        std::cout << "Started analyzing call: " << callId << std::endl;
+        return true;
+    }
+    
+    /**
+     * @brief Stop analyzing a call
+     * @param callId Unique identifier for the call
+     */
+    void endCall(const std::string& callId) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        auto it = m_activeCalls.find(callId);
+        if (it != m_activeCalls.end()) {
+            // Generate final analysis and store in call history
+            auto finalResult = generateFinalAnalysis(callId);
+            m_callHistory[callId] = finalResult;
+            
+            // Remove from active calls
+            m_activeCalls.erase(it);
+            std::cout << "Ended analyzing call: " << callId << std::endl;
+        }
+    }
+    
+    /**
+     * @brief Process an audio frame from a call
+     * @param callId Unique identifier for the call
+     * @param audioData Raw audio data
+     * @param sizeBytes Size of audio data in bytes
+     * @param isCustomerAudio True if audio is from customer, false if from agent
+     * @return Analysis result for this frame
+     */
+    AnalysisResult processAudioFrame(const std::string& callId, 
+                                   const uint8_t* audioData, 
+                                   size_t sizeBytes,
+                                   bool isCustomerAudio) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        auto it = m_activeCalls.find(callId);
+        if (it == m_activeCalls.end()) {
+            std::cerr << "Call ID not active: " << callId << std::endl;
+            return AnalysisResult();
+        }
+        
+        // Create audio frame object
+        AudioProcessor::Frame frame;
+        frame.data.assign(audioData, audioData + sizeBytes);
+        frame.isCustomerAudio = isCustomerAudio;
+        frame.timestamp = std::chrono::system_clock::now();
+        
+        // Add to processing queue
+        m_audioQueue.push(std::make_pair(callId, frame));
+        m_condition.notify_one();
+        
+        // Return latest result for this call (might be from previous frame)
+        return m_latestResults[callId];
+    }
+    
+    /**
+     * @brief Get call history for completed calls
+     * @return Map of call IDs to final analysis results
+     */
+    const std::unordered_map<std::string, AnalysisResult>& getCallHistory() const {
+        return m_callHistory;
+    }
+    
+    /**
+     * @brief Stop all processing
+     */
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_isRunning) {
+                return;
+            }
+            m_isRunning = false;
+            m_condition.notify_all();
+        }
+        
+        if (m_processingThread && m_processingThread->joinable()) {
+            m_processingThread->join();
+        }
+    }
+    
+private:
+    /**
+     * @brief Main processing loop
+     */
+    void processingLoop() {
+        while (m_isRunning) {
+            std::pair<std::string, AudioProcessor::Frame> item;
+            
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_condition.wait(lock, [this] {
+                    return !m_isRunning || !m_audioQueue.empty();
+                });
+                
+                if (!m_isRunning && m_audioQueue.empty()) {
+                    break;
+                }
+                
+                item = m_audioQueue.front();
+                m_audioQueue.pop();
+            }
+            
+            // Process the audio frame
+            processAudioFrameInternal(item.first, item.second);
+        }
+    }
+    
+    /**
+     * @brief Internal audio frame processing
+     * @param callId Call identifier
+     * @param frame Audio frame
+     */
+    void processAudioFrameInternal(const std::string& callId, const AudioProcessor::Frame& frame) {
+        AnalysisResult result;
+        result.callId = callId;
+        result.timestamp = frame.timestamp;
+        
+        // Step 1: Transcribe audio if enabled
+        if (m_config.enableTranscription && m_transcriber) {
+            result.transcriptSegment = m_transcriber->transcribeAudio(
+                frame.data.data(), frame.data.size(), frame.isCustomerAudio);
+        }
+        
+        // Step 2: Analyze sentiment if enabled
+        if (m_config.enableSentimentAnalysis && m_sentimentAnalyzer) {
+            if (frame.isCustomerAudio) {
+                result.customerSentiment = m_sentimentAnalyzer->analyzeSentiment(result.transcriptSegment);
+            } else {
+                result.agentSentiment = m_sentimentAnalyzer->analyzeSentiment(result.transcriptSegment);
+            }
+        }
+        
+        // Step 3: Check compliance if enabled
+        if (m_config.enableComplianceChecking && m_complianceChecker) {
+            result.complianceAlerts = m_complianceChecker->checkCompliance(result.transcriptSegment);
+        }
+        
+        // Step 4: Generate response suggestions
+        result.suggestedResponses = generateResponseSuggestions(result);
+        
+        // Store the latest result
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_latestResults[callId] = result;
+        }
+        
+        // Send real-time updates to CXone
+        sendRealtimeUpdate(result);
+    }
+    
+    /**
+     * @brief Generate final analysis for a call
+     * @param callId Call identifier
+     * @return Final analysis result
+     */
+    AnalysisResult generateFinalAnalysis(const std::string& callId) {
+        AnalysisResult finalResult;
+        finalResult.callId = callId;
+        
+        // In a real implementation, this would aggregate all analysis results
+        // for the call and generate comprehensive statistics
+        
+        return finalResult;
+    }
+    
+    /**
+     * @brief Generate response suggestions based on analysis
+     * @param result Current analysis result
+     * @return Vector of suggested responses
+     */
+    std::vector<std::string> generateResponseSuggestions(const AnalysisResult& result) {
+        std::vector<std::string> suggestions;
+        
+        // Example logic for generating suggestions based on sentiment and compliance
+        if (result.customerSentiment < -0.5f) {
+            // Customer appears upset
+            suggestions.push_back(m_responseTemplates["upset_customer"]);
+        }
+        
+        if (!result.complianceAlerts.empty()) {
+            // Compliance issues detected
+            suggestions.push_back(m_responseTemplates["compliance_correction"]);
+        }
+        
+        return suggestions;
+    }
+    
+    /**
+     * @brief Send real-time update to CXone platform
+     * @param result Analysis result to send
+     */
+    void sendRealtimeUpdate(const AnalysisResult& result) {
+        if (m_cxoneApi) {
+            m_cxoneApi->sendRealtimeAnalysis(result.callId, 
+                                           result.transcriptSegment,
+                                           result.customerSentiment,
+                                           result.agentSentiment,
+                                           result.complianceAlerts,
+                                           result.suggestedResponses);
+        }
+    }
+    
+    /**
+     * @brief Load response templates
+     */
+    void loadResponseTemplates() {
+        // In a real implementation, these would be loaded from a database or file
+        m_responseTemplates["upset_customer"] = "I understand this is frustrating. Let me help resolve this for you.";
+        m_responseTemplates["compliance_correction"] = "I need to provide you with some important information about our policies.";
+        m_responseTemplates["appointment_scheduling"] = "I can help you schedule that appointment. Let me check the available times.";
+        m_responseTemplates["medical_information"] = "For specific medical advice, I recommend speaking directly with your physician.";
+    }
+    
+private:
+    Config m_config;
+    std::atomic<bool> m_isRunning;
+    std::unique_ptr<std::thread> m_processingThread;
+    
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
+    
+    std::queue<std::pair<std::string, AudioProcessor::Frame>> m_audioQueue;
+    std::unordered_map<std::string, std::vector<AnalysisResult>> m_activeCalls;
+    std::unordered_map<std::string, AnalysisResult> m_latestResults;
+    std::unordered_map<std::string, AnalysisResult> m_callHistory;
+    
+    std::unique_ptr<CXoneAPI> m_cxoneApi;
+    std::unique_ptr<AudioProcessor> m_audioProcessor;
+    std::unique_ptr<CallTranscriber> m_transcriber;
+    std::unique_ptr<SentimentAnalyzer> m_sentimentAnalyzer;
+    std::unique_ptr<HealthcareCompliance> m_complianceChecker;
+    
+    std::unordered_map<std::string, std::string> m_responseTemplates;
+};
+
+// Example usage
+int main(int argc, char* argv[]) {
+    // Configure the analyzer
+    HealthcareCallAnalyzer::Config config;
+    config.apiKey = "your-cxone-api-key";
+    config.apiEndpoint = "https://api.cxone.nice-incontact.com/v1";
+    config.complianceRulesPath = "healthcare_compliance_rules.json";
+    
+    // Create analyzer instance
+    HealthcareCallAnalyzer analyzer(config);
+    
+    // Start analyzing a call
+    std::string callId = "healthcare-call-123456";
+    analyzer.startCall(callId);
+    
+    // Simulated audio processing loop
+    const int BUFFER_SIZE = 1600; // 100ms of 8kHz 16-bit audio
+    uint8_t audioBuffer[BUFFER_SIZE];
+    
+    for (int i = 0; i < 600; i++) { // Simulate 60 seconds of audio
+        // In a real application, this would be actual audio data
+        // For demo purposes, we're just filling with dummy data
+        for (int j = 0; j < BUFFER_SIZE; j++) {
+            audioBuffer[j] = static_cast<uint8_t>(rand() % 256);
+        }
+        
+        // Process the audio frame (alternate between customer and agent)
+        bool isCustomerAudio = (i % 2 == 0);
+        auto result = analyzer.processAudioFrame(callId, audioBuffer, BUFFER_SIZE, isCustomerAudio);
+        
+        // Example of using the result
+        if (!result.transcriptSegment.empty()) {
+            std::cout << "Transcript: " << result.transcriptSegment << std::endl;
+        }
+        
+        if (!result.suggestedResponses.empty()) {
+            std::cout << "Suggestion: " << result.suggestedResponses[0] << std::endl;
+        }
+        
+        // Simulate real-time processing
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    // End the call
+    analyzer.endCall(callId);
+    
+    return 0;
+}
